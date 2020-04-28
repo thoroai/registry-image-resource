@@ -1,0 +1,153 @@
+---
+# Reusable YAML Anchors
+# ============
+
+yaml_anchors:
+  tags: &tags [ ]
+
+  slack_channel: &notifier "#devops_aws"
+
+  job_defaults: &job-defaults
+    on_failure: &job-failed
+      put: *notifier
+      tags: *tags
+      params:
+        mode: &notify-mode concise
+        alert_type: failed
+
+    on_abort: &job-aborted
+      put: *notifier
+      tags: *tags
+      params:
+        mode: *notify-mode
+        alert_type: aborted
+
+    on_error: *job-failed
+
+    build_log_retention: &build-log-retention
+      builds: 10
+      minimum_succeeded_builds: 2
+
+  build: &build
+    task: build
+    file: registry-image-resource/ci/tasks/build.yml
+    privileged: true
+    tags: *tags
+    input_mapping:
+      repo: registry-image-resource
+    output_mapping:
+      image: image
+    params:
+      CONTEXT: repo
+      DOCKERFILE: repo/dockerfiles/alpine/Dockerfile
+
+# Pipeline Jobs
+# =============
+
+jobs:
+  # Lambda Deployer
+  - name: waterfall
+    <<: *job-defaults
+
+    plan:
+      - get: registry-image-resource
+        trigger: true
+        tags: *tags
+
+      - *build
+
+      - put: registry-image-resource-image
+        params:
+          image: image/image.tar
+
+  - name: pr-waterfall
+    <<: *job-defaults
+
+    plan:
+      - get: registry-image-resource
+        resource: registry-image-resource-pull-request
+        tags: *tags
+        trigger: true
+        version: every
+
+      - &put-pr-check
+        put: update-status
+        resource: registry-image-resource-pull-request
+        tags: *tags
+        params:
+          path: registry-image-resource
+          status: pending
+
+      - <<: *build
+        on_failure:
+          <<: *put-pr-check
+          params:
+            path: registry-image-resource
+            status: failure
+
+      - <<: *put-pr-check
+        params:
+          path: registry-image-resource
+          status: success
+
+# Pipeline Resources
+# ==================
+
+resource_types:
+  - name: pull-request
+    type: docker-image
+    tags: *tags
+    source:
+      repository: teliaoss/github-pr-resource
+
+  - name: slack-notifier
+    type: registry-image
+    tags: *tags
+    source: {repository: mockersf/concourse-slack-notifier}
+
+
+resources:
+
+  # Project repos
+  # -------------
+
+  - name: registry-image-resource
+    type: git
+    icon: git
+    tags: *tags
+    source:
+      uri: git@github.com:thoroai/registry-image-resource.git
+      branch: feat/working
+      private_key: ((registry-image-resource-deploy-key))
+
+  # Artifact storage
+  # ----------------
+
+  - name: registry-image-resource-image
+    type: registry-image
+    source:
+      repository: crl-docker.jfrog.io/carnegierobotics/registry-image-resource
+      username: ((writer-artifactory-user))
+      password: ((writer-artifactory-token))
+
+  # Notifications
+  # -------------
+
+  - name: *notifier
+    icon: slack
+    type: slack-notifier
+    tags: *tags
+    source:
+      url: ((slack_webhook_url_devops_aws))
+      disabled: true
+
+  - name: registry-image-resource-pull-request
+    type: pull-request
+    icon: source-pull
+    tags: *tags
+    check_every: 10m
+    # webhook_token: ((webhook_token))
+    source:
+      repository: thoroai/registry-image-resource
+      base_branch: feat/working
+      access_token: ((thoroai-access-token))
